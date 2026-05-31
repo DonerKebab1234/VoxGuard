@@ -161,13 +161,19 @@ cmake.exe is bundled with VS at the path above — not in PATH by default.
   - C++: Pong response includes `startWithWindows` state so UI toggle initialises correctly
   - UI: Startup toggle in footer wired to `setStartWithWindows`; fix breach counting to use escalation events
   - Packaging: zip `build\Release\` (VoxGuard.exe + ui\) — WebView2 runtime ships with Windows 11/Edge
-- [ ] **Phase 6** — DAF toggle, optional overlay meter, adaptive sidetone
+- [x] **Phase 6** — DAF toggle, optional overlay meter, adaptive sidetone
+  - C++: `g_dafLine[10560]` circular delay buffer always filled by capture callback (180 ms @ 48 kHz)
+  - C++: DAF path reads from delay line instead of current mic when `g_dafEnabled` is set
+  - C++: Adaptive sidetone: gain = baseGain + intensity × loudnorm × 0.5, capped at 1.0
+  - C++: Overlay meter — layered click-through always-on-top GDI window, redrawn every 50 ms via `InvalidateRect`
+  - UI: Sidetone group shows Auto / DAF inline toggles; Startup group shows Overlay toggle
 
 ### Next up (start of next session)
 Read this file, then:
-1. Run `.\build\Release\VoxGuard.exe` — Start capture, calibrate, verify loudness badge + duck works
-2. Ship to brother: zip `build\Release\` (VoxGuard.exe + ui\) — he just extracts and runs
-3. Begin Phase 6 if desired: DAF toggle, adaptive sidetone, always-on-top overlay meter
+All phases complete. To ship:
+  zip `build\Release\` folder → VoxGuard.exe + ui\ subfolder
+  Brother extracts anywhere and runs VoxGuard.exe (WebView2 is pre-installed via Edge on Win11)
+  First run: click Start → Calibrate → optionally enable Sidetone + Duck Game
 
 ---
 

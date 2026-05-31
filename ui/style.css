@@ -517,6 +517,17 @@ html, body {
 /* Compact select for tight footer space */
 .select--sm { max-width: 120px; font-size: 11px; }
 
+/* Inline tag label between two toggles */
+.setting-tag {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin-left: 2px;
+  flex-shrink: 0;
+}
+
 /* Escalation flash on status label */
 .status-label.escalating {
   color: var(--red);

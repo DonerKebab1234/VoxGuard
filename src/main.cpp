@@ -133,8 +133,36 @@ static std::atomic<int>   g_chimeLeft{0};
 
 static NOTIFYICONDATAW g_nid{};   // explicit W variant; NOTIFYICONDATA is ANSI under WIN32_LEAN_AND_MEAN
 static HMENU          g_trayMenu    = nullptr;
-static bool           g_hiddenToTray = false;  // true while window is hidden in tray
-static bool           g_startMinimized = false; // set from /minimized command-line flag      // frames remaining to play
+static bool           g_hiddenToTray   = false;
+static bool           g_startMinimized = false;
+
+// ── DAF — Delayed Auditory Feedback (Phase 6) ─────────────────────
+// Delays the sidetone by ~180 ms, disrupting speech fluency and
+// causing the user to speak more quietly (the delayed-feedback effect).
+// OFF by default — it's an optional deterrent, not comfortable.
+//
+// Implementation: a fixed-size circular delay line in the capture
+// callback, shared with the sidetone write path.
+// Read is always DAF_DELAY_FRAMES behind the write head.
+// Both pointers are on the capture thread side; only g_dafWrite is
+// shared (atomically) with the playback path.
+static std::atomic<bool> g_dafEnabled{false};
+static constexpr int DAF_SR           = 48000;
+static constexpr int DAF_DELAY_FRAMES = DAF_SR * 180 / 1000;   // 8640 frames
+static constexpr int DAF_MAX_FRAMES   = DAF_SR * 220 / 1000;   // 10560 frames
+static float         g_dafLine[DAF_MAX_FRAMES]{};               // ~41 KB static
+static std::atomic<int> g_dafWriteHead{0};
+
+// ── Adaptive sidetone (Phase 6) ────────────────────────────────────
+// When enabled, sidetone gain rises with mic loudness so the user
+// always hears themselves clearly above the masker without needing to
+// consciously increase volume.
+static std::atomic<bool>  g_adaptiveSidetone{false};
+static std::atomic<float> g_adaptiveIntensity{0.5f};  // 0–1
+
+// ── Overlay meter (Phase 6) ────────────────────────────────────────
+static HWND g_overlayHwnd = nullptr;
+static bool g_overlayVisible = false;
 
 // ─────────────────────────────────────────────────────────────────
 // Audio — capture callback (real-time thread, no COM, no malloc)
@@ -161,27 +189,59 @@ static void AudioCaptureCallback(ma_device* /*dev*/,
     g_currentDbfs.store(std::max(-60.0f, std::min(0.0f, dbfs)),
                         std::memory_order_relaxed);
 
-    // ── Sidetone feed ─────────────────────────────────────────────
-    // Write gain-scaled mono mic into the ring buffer as stereo.
-    // The playback callback drains it independently on the playback thread.
+    // ── DAF delay line — fill unconditionally ────────────────────────
+    // Always keep the line populated so DAF can be toggled on-the-fly
+    // without a burst of silence at the start.
+    {
+        int wHead = g_dafWriteHead.load(std::memory_order_relaxed);
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            g_dafLine[wHead] = s[i];
+            if (++wHead >= DAF_MAX_FRAMES) wHead = 0;
+        }
+        // release so the playback thread sees fully-written samples
+        g_dafWriteHead.store(wHead, std::memory_order_release);
+    }
+
+    // ── Sidetone / DAF feed into playback ring buffer ─────────────
     if (g_sidetoneRbReady && g_sidetoneEnabled.load(std::memory_order_relaxed)) {
-        const float gain = g_sidetoneGain.load(std::memory_order_relaxed);
-        ma_uint32   toWrite = frameCount;
-        void*       writePtr = nullptr;
+
+        // Base gain from slider (0–1)
+        float gain = g_sidetoneGain.load(std::memory_order_relaxed);
+
+        // Adaptive gain: boost sidetone proportionally to current loudness.
+        // This ensures the user always hears themselves over the game/masker.
+        if (g_adaptiveSidetone.load(std::memory_order_relaxed)) {
+            float intensity = g_adaptiveIntensity.load(std::memory_order_relaxed);
+            float loudNorm  = (dbfs + 60.0f) / 60.0f;  // 0 at silence → 1 at 0 dBFS
+            gain = std::min(1.0f, gain + intensity * loudNorm * 0.5f);
+        }
+
+        bool daf = g_dafEnabled.load(std::memory_order_relaxed);
+        // For DAF, determine read position (180 ms behind current write head)
+        int dafReadHead = 0;
+        if (daf) {
+            int wHead = g_dafWriteHead.load(std::memory_order_relaxed);
+            dafReadHead = (wHead - DAF_DELAY_FRAMES + DAF_MAX_FRAMES * 2)
+                          % DAF_MAX_FRAMES;
+        }
+
+        ma_uint32 toWrite = frameCount;
+        void*     writePtr = nullptr;
         if (ma_pcm_rb_acquire_write(&g_sidetoneRb, &toWrite, &writePtr) == MA_SUCCESS
             && toWrite > 0)
         {
-            float*       dst = static_cast<float*>(writePtr);
-            const float* src = static_cast<const float*>(pInput);
+            float* dst = static_cast<float*>(writePtr);
             for (ma_uint32 i = 0; i < toWrite; ++i) {
-                float s       = src[i] * gain;
-                dst[i * 2]     = s;  // left
-                dst[i * 2 + 1] = s;  // right
+                float sample = daf
+                    ? g_dafLine[(dafReadHead + static_cast<int>(i)) % DAF_MAX_FRAMES]
+                    : s[i];
+                float out = sample * gain;
+                dst[i * 2]     = out;   // left
+                dst[i * 2 + 1] = out;   // right
             }
             ma_pcm_rb_commit_write(&g_sidetoneRb, toWrite);
         }
-        // If the ring buffer is full (toWrite == 0), we just drop samples.
-        // This can only happen if the playback device stalls — rare in normal use.
+        // Full ring buffer = playback stalled; drop this batch silently.
     }
 }
 
@@ -366,6 +426,83 @@ static void StopSidetone()
     ma_device_uninit(&g_playbackDevice);
     g_sidetoneDevActive = false;
     // Leave the ring buffer alive (cheap to keep, avoids re-init cost if re-enabled)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Phase 6 — Overlay meter (always-on-top translucent GDI window)
+// ─────────────────────────────────────────────────────────────────
+
+static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+
+        // Black background
+        HBRUSH bgBrush = CreateSolidBrush(RGB(0, 0, 0));
+        FillRect(hdc, &rc, bgBrush);
+        DeleteObject(bgBrush);
+
+        // Level bar
+        float dbfs    = g_currentDbfs.load(std::memory_order_relaxed);
+        float level   = std::max(0.0f, std::min(1.0f, (dbfs + 60.0f) / 60.0f));
+        int   barH    = static_cast<int>(rc.bottom * level);
+        COLORREF col  = (dbfs > -6.0f)  ? RGB(255, 60, 60)  :
+                        (dbfs > -12.0f) ? RGB(232, 178, 0) :
+                                           RGB(32, 212, 114);
+        RECT bar = { 6, rc.bottom - barH, rc.right - 6, rc.bottom };
+        HBRUSH barBrush = CreateSolidBrush(col);
+        FillRect(hdc, &bar, barBrush);
+        DeleteObject(barBrush);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    if (msg == WM_DESTROY) { g_overlayHwnd = nullptr; g_overlayVisible = false; }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void OverlayCreate(HINSTANCE hInst)
+{
+    if (g_overlayHwnd) return;
+
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = OverlayWndProc;
+    wc.hInstance     = hInst;
+    wc.lpszClassName = L"VoxGuardOverlay";
+    RegisterClassExW(&wc);
+
+    // Get primary monitor work area for placement
+    RECT wa{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+
+    // Small strip in top-right corner: 48 × 220 px
+    int W = 48, H = 220;
+    int x = wa.right  - W - 12;
+    int y = wa.top    + 40;
+
+    g_overlayHwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+        L"VoxGuardOverlay", nullptr,
+        WS_POPUP,
+        x, y, W, H,
+        nullptr, nullptr, hInst, nullptr
+    );
+
+    // 75% opaque black background
+    SetLayeredWindowAttributes(g_overlayHwnd, 0, 190, LWA_ALPHA);
+    ShowWindow(g_overlayHwnd, SW_SHOWNOACTIVATE);
+    g_overlayVisible = true;
+}
+
+static void OverlayDestroy()
+{
+    if (g_overlayHwnd) { DestroyWindow(g_overlayHwnd); g_overlayHwnd = nullptr; }
+    g_overlayVisible = false;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -786,6 +923,40 @@ static HRESULT HandleJsMessage(ICoreWebView2* wv,
             } catch (...) {}
         }
 
+    } else if (msg.find(L"\"type\":\"setDaf\"") != std::wstring::npos) {
+        bool en = msg.find(L"\"enabled\":true") != std::wstring::npos;
+        g_dafEnabled.store(en, std::memory_order_relaxed);
+        wv->PostWebMessageAsJson(L"{\"type\":\"dafSet\",\"ok\":true}");
+
+    } else if (msg.find(L"\"type\":\"setAdaptiveSidetone\"") != std::wstring::npos) {
+        bool en = msg.find(L"\"enabled\":true") != std::wstring::npos;
+        g_adaptiveSidetone.store(en, std::memory_order_relaxed);
+
+    } else if (msg.find(L"\"type\":\"setAdaptiveIntensity\"") != std::wstring::npos) {
+        auto pos = msg.find(L"\"value\":");
+        if (pos != std::wstring::npos) {
+            pos += 8;
+            try {
+                float v = std::stof(msg.substr(pos)) / 100.0f;
+                g_adaptiveIntensity.store(std::max(0.0f, std::min(1.0f, v)),
+                                          std::memory_order_relaxed);
+            } catch (...) {}
+        }
+
+    } else if (msg.find(L"\"type\":\"setOverlay\"") != std::wstring::npos) {
+        bool en = msg.find(L"\"enabled\":true") != std::wstring::npos;
+        if (en && !g_overlayHwnd) {
+            // Get HINSTANCE from g_hwnd
+            HINSTANCE hInst = reinterpret_cast<HINSTANCE>(
+                GetWindowLongPtrW(g_hwnd, GWLP_HINSTANCE));
+            OverlayCreate(hInst);
+        } else if (!en && g_overlayHwnd) {
+            OverlayDestroy();
+        }
+        wv->PostWebMessageAsJson(en
+            ? L"{\"type\":\"overlaySet\",\"visible\":true}"
+            : L"{\"type\":\"overlaySet\",\"visible\":false}");
+
     } else if (msg.find(L"\"type\":\"setChime\"") != std::wstring::npos) {
         bool en = msg.find(L"\"enabled\":true") != std::wstring::npos;
         g_chimeEnabled.store(en, std::memory_order_relaxed);
@@ -998,6 +1169,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         swprintf_s(buf, L"{\"type\":\"meter\",\"dbfs\":%.1f}", dbfs);
         g_webview->PostWebMessageAsJson(buf);
 
+        // Repaint the always-on-top overlay (if visible)
+        if (g_overlayHwnd) InvalidateRect(g_overlayHwnd, nullptr, FALSE);
+
         // ── 2. Rolling average (store linear power, average, convert back) ──
         // Averaging dBFS directly is an approximation; this is close enough
         // for a coaching tool operating in a narrow 60 dB range.
@@ -1136,6 +1310,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
+        OverlayDestroy();
         TrayDestroy();
         RestoreDuck();
         StopSidetone();

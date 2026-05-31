@@ -472,3 +472,12 @@ document.getElementById('masterEnable')?.addEventListener('change', e => {
 document.getElementById('startWithWindows')?.addEventListener('change', e => {
   sendMsg({ type: 'setStartWithWindows', enabled: e.target.checked });
 });
+document.getElementById('dafEnable')?.addEventListener('change', e => {
+  sendMsg({ type: 'setDaf', enabled: e.target.checked });
+});
+document.getElementById('adaptiveSidetone')?.addEventListener('change', e => {
+  sendMsg({ type: 'setAdaptiveSidetone', enabled: e.target.checked });
+});
+document.getElementById('overlayEnable')?.addEventListener('change', e => {
+  sendMsg({ type: 'setOverlay', enabled: e.target.checked });
+});
