@@ -134,7 +134,11 @@ cmake.exe is bundled with VS at the path above — not in PATH by default.
 - [x] **Phase 1** — miniaudio mic capture + dBFS computation + live segmented meter pushed over bridge + device picker
   - Already wired into main.cpp (WM_TIMER, AudioCaptureCallback, GetCaptureDevicesJson, StartAudioCapture)
   - Verify: click Start, see the meter animate to your mic input, pick a specific device from dropdown
-- [ ] **Phase 2** — Sidetone: route mic → headphones; level slider wired to C++
+- [x] **Phase 2** — Sidetone: route mic → headphones; level slider wired to C++
+  - `ma_pcm_rb` ring buffer (100 ms / 4800 stereo frames) connects capture → playback threads
+  - `g_sidetoneEnabled` / `g_sidetoneGain` atomics; `StartSidetone()` / `StopSidetone()`
+  - Bridge: `setSidetone {enabled}` and `setSidetoneLevel {value: 0–100}` both wired
+  - Verify: Start capture, toggle Sidetone ON in footer — you should hear yourself in headphones
 - [ ] **Phase 3** — Calibration flow (2-step), derive normal/too-loud thresholds, sustained-loudness window
 - [ ] **Phase 4** — Auto-duck-while-speaking + escalation duck + chime
 - [ ] **Phase 5** — System tray, start-with-Windows, session stats/quiet-score, packaging to .exe
@@ -142,9 +146,8 @@ cmake.exe is bundled with VS at the path above — not in PATH by default.
 
 ### Next up (start of next session)
 Read this file, then:
-1. Confirm Phase 0+1 build (see Build steps above for the full cmake path — cmake is not in PATH)
-2. Run `.\build\Release\VoxGuard.exe` — verify window opens and meter works
-3. Begin Phase 2: sidetone (mic → output device loopback via miniaudio duplex mode)
+1. Run `.\build\Release\VoxGuard.exe` — click Start, toggle Sidetone ON, verify you hear yourself
+2. Begin Phase 3: calibration flow (2-step guided, 5s each) + threshold derivation + sustained-loudness window
 
 ---
 

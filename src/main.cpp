@@ -1,16 +1,21 @@
 /*
  * VoxGuard — Voice-volume coaching tool
- * main.cpp — Phase 0+1: Win32 window, WebView2 shell, bridge, mic capture, live dBFS meter
+ * main.cpp — Phase 0+1+2: Win32/WebView2, bridge, mic capture, dBFS meter, sidetone
  *
  * Threading model:
- *   UI thread    — Win32 message loop, WebView2 callbacks, all COM calls
- *   Audio thread — miniaudio real-time capture callback (never touches COM/WebView)
+ *   UI thread      — Win32 message loop, WebView2 callbacks, all COM calls
+ *   Capture thread — miniaudio capture callback → writes g_currentDbfs + sidetone ring buf
+ *   Playback thread— miniaudio playback callback → reads sidetone ring buf → headphones
  *
- * Shared state between threads: g_currentDbfs (std::atomic<float>).
- * A WM_TIMER on the UI thread reads it and posts the value to JS every 50 ms.
+ * Cross-thread shared state:
+ *   g_currentDbfs     std::atomic<float>    — metering only
+ *   g_sidetoneEnabled std::atomic<bool>     — toggled from UI thread, read on audio threads
+ *   g_sidetoneGain    std::atomic<float>    — same
+ *   g_sidetoneRb      ma_pcm_rb             — lock-free ring buffer; single producer
+ *                                             (capture), single consumer (playback)
  *
- * Audio runs in WASAPI SHARED mode so Discord and the game can share the mic device.
- * Buffer size ~10 ms (miniaudio default for WASAPI shared) → end-to-end latency < 15 ms.
+ * Audio runs in WASAPI SHARED mode so Discord and the game coexist on the same device.
+ * Buffer size ~10 ms (miniaudio WASAPI shared default) → sidetone latency < 15 ms.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -40,10 +45,21 @@ static HWND g_hwnd = nullptr;
 static ComPtr<ICoreWebView2Controller> g_controller;
 static ComPtr<ICoreWebView2>           g_webview;
 
-// Audio state — written by audio thread, read by UI thread
+// ── Capture state ────────────────────────────────────────────────
 static std::atomic<float> g_currentDbfs{-60.0f};
 static ma_device          g_captureDevice{};
 static bool               g_audioActive = false;
+
+// ── Sidetone state ───────────────────────────────────────────────
+// Ring buffer: 100 ms of stereo float at 48 kHz = 4800 stereo frames.
+// Single producer = capture callback, single consumer = playback callback.
+static ma_pcm_rb          g_sidetoneRb{};
+static bool               g_sidetoneRbReady    = false;
+static ma_device          g_playbackDevice{};
+static bool               g_sidetoneDevActive  = false;
+
+static std::atomic<bool>  g_sidetoneEnabled{false};
+static std::atomic<float> g_sidetoneGain{0.4f};  // 0–1; default 40%
 
 // ─────────────────────────────────────────────────────────────────
 // Audio — capture callback (real-time thread, no COM, no malloc)
@@ -69,6 +85,29 @@ static void AudioCaptureCallback(ma_device* /*dev*/,
     float dbfs = (rms > 1e-7f) ? 20.0f * std::log10(rms) : -60.0f;
     g_currentDbfs.store(std::max(-60.0f, std::min(0.0f, dbfs)),
                         std::memory_order_relaxed);
+
+    // ── Sidetone feed ─────────────────────────────────────────────
+    // Write gain-scaled mono mic into the ring buffer as stereo.
+    // The playback callback drains it independently on the playback thread.
+    if (g_sidetoneRbReady && g_sidetoneEnabled.load(std::memory_order_relaxed)) {
+        const float gain = g_sidetoneGain.load(std::memory_order_relaxed);
+        ma_uint32   toWrite = frameCount;
+        void*       writePtr = nullptr;
+        if (ma_pcm_rb_acquire_write(&g_sidetoneRb, &toWrite, &writePtr) == MA_SUCCESS
+            && toWrite > 0)
+        {
+            float*       dst = static_cast<float*>(writePtr);
+            const float* src = static_cast<const float*>(pInput);
+            for (ma_uint32 i = 0; i < toWrite; ++i) {
+                float s       = src[i] * gain;
+                dst[i * 2]     = s;  // left
+                dst[i * 2 + 1] = s;  // right
+            }
+            ma_pcm_rb_commit_write(&g_sidetoneRb, toWrite);
+        }
+        // If the ring buffer is full (toWrite == 0), we just drop samples.
+        // This can only happen if the playback device stalls — rare in normal use.
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -160,6 +199,82 @@ static bool StartAudioCapture(int deviceIndex)
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Sidetone playback (called from UI thread to start/stop)
+// ─────────────────────────────────────────────────────────────────
+
+// Playback callback: drain the sidetone ring buffer → headphones.
+// Runs on miniaudio's dedicated playback thread.
+static void AudioPlaybackCallback(ma_device* /*dev*/,
+                                   void*       pOutput,
+                                   const void* /*pInput*/,
+                                   ma_uint32   frameCount)
+{
+    float* out = static_cast<float*>(pOutput);
+
+    if (!g_sidetoneRbReady) {
+        std::memset(out, 0, frameCount * 2 * sizeof(float));
+        return;
+    }
+
+    ma_uint32 toRead   = frameCount;
+    void*     readPtr  = nullptr;
+    if (ma_pcm_rb_acquire_read(&g_sidetoneRb, &toRead, &readPtr) == MA_SUCCESS
+        && toRead > 0)
+    {
+        std::memcpy(out, readPtr, toRead * 2 * sizeof(float));
+        ma_pcm_rb_commit_read(&g_sidetoneRb, toRead);
+        // If ring buffer had fewer frames than requested, zero the remainder
+        if (toRead < frameCount)
+            std::memset(out + toRead * 2, 0, (frameCount - toRead) * 2 * sizeof(float));
+    } else {
+        // Underrun: output silence (happens briefly on first start or if capture stalls)
+        std::memset(out, 0, frameCount * 2 * sizeof(float));
+    }
+}
+
+// Start the sidetone playback device.
+// The ring buffer is initialized once and stays alive for the session.
+static bool StartSidetone()
+{
+    if (g_sidetoneDevActive) return true;
+
+    // Init the ring buffer on first call
+    if (!g_sidetoneRbReady) {
+        // 4800 stereo frames = 100 ms at 48 kHz — enough headroom for any callback size
+        if (ma_pcm_rb_init(ma_format_f32, 2, 4800,
+                           nullptr, nullptr, &g_sidetoneRb) != MA_SUCCESS)
+            return false;
+        g_sidetoneRbReady = true;
+    }
+
+    ma_device_config cfg   = ma_device_config_init(ma_device_type_playback);
+    cfg.playback.format    = ma_format_f32;
+    cfg.playback.channels  = 2;      // stereo headphones
+    cfg.sampleRate         = 48000;
+    cfg.dataCallback       = AudioPlaybackCallback;
+    // Use system default playback device (headphones selected in Windows Sound settings)
+
+    if (ma_device_init(nullptr, &cfg, &g_playbackDevice) != MA_SUCCESS)
+        return false;
+
+    if (ma_device_start(&g_playbackDevice) != MA_SUCCESS) {
+        ma_device_uninit(&g_playbackDevice);
+        return false;
+    }
+
+    g_sidetoneDevActive = true;
+    return true;
+}
+
+static void StopSidetone()
+{
+    if (!g_sidetoneDevActive) return;
+    ma_device_uninit(&g_playbackDevice);
+    g_sidetoneDevActive = false;
+    // Leave the ring buffer alive (cheap to keep, avoids re-init cost if re-enabled)
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────
 
@@ -221,6 +336,31 @@ static HRESULT HandleJsMessage(ICoreWebView2* wv,
         resp += GetCaptureDevicesJson();
         resp += L"}";
         wv->PostWebMessageAsJson(resp.c_str());
+
+    } else if (msg.find(L"\"type\":\"setSidetone\"") != std::wstring::npos) {
+        bool enable = msg.find(L"\"enabled\":true") != std::wstring::npos;
+        g_sidetoneEnabled.store(enable, std::memory_order_relaxed);
+        if (enable) {
+            bool ok = StartSidetone();
+            wv->PostWebMessageAsJson(ok ? L"{\"type\":\"sidetoneSet\",\"ok\":true}"
+                                       : L"{\"type\":\"sidetoneSet\",\"ok\":false}");
+        } else {
+            // Keep device alive but silence it (gain=0 effectively via enabled flag)
+            wv->PostWebMessageAsJson(L"{\"type\":\"sidetoneSet\",\"ok\":true}");
+        }
+
+    } else if (msg.find(L"\"type\":\"setSidetoneLevel\"") != std::wstring::npos) {
+        // Parse "value": N  (0–100)
+        auto pos = msg.find(L"\"value\":");
+        if (pos != std::wstring::npos) {
+            pos += 8;
+            while (pos < msg.size() && msg[pos] == L' ') ++pos;
+            try {
+                float v = std::stof(msg.substr(pos)) / 100.0f;
+                g_sidetoneGain.store(std::max(0.0f, std::min(1.0f, v)),
+                                     std::memory_order_relaxed);
+            } catch (...) {}
+        }
 
     } else if (msg.find(L"\"type\":\"startCapture\"") != std::wstring::npos) {
         // JS asked to start capture on a device index
@@ -320,6 +460,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
+        StopSidetone();
+        if (g_sidetoneRbReady) {
+            ma_pcm_rb_uninit(&g_sidetoneRb);
+            g_sidetoneRbReady = false;
+        }
         if (g_audioActive) {
             ma_device_uninit(&g_captureDevice);
             g_audioActive = false;
