@@ -21,13 +21,15 @@ Developed/tested on my own mic first, then shipped as a standalone .exe.
 ### Build steps
 ```powershell
 # From C:\Users\epost\projects\voxguard\
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
+$cmake = "C:\Program Files\Microsoft Visual Studio\18\Insiders\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+& $cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+& $cmake --build build --config Release
 # Executable: build\Release\VoxGuard.exe
 # UI folder:  build\Release\ui\   (copied automatically as post-build step)
 ```
 
-If you have VS 2019, use `-G "Visual Studio 16 2019"` instead.
+Generator is "Visual Studio 18 2026" because the machine has VS 2025 Insiders (VS18).
+cmake.exe is bundled with VS at the path above — not in PATH by default.
 
 ### Run
 ```powershell
@@ -140,7 +142,7 @@ If you have VS 2019, use `-G "Visual Studio 16 2019"` instead.
 
 ### Next up (start of next session)
 Read this file, then:
-1. Confirm Phase 0+1 build: `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 && cmake --build build --config Release`
+1. Confirm Phase 0+1 build (see Build steps above for the full cmake path — cmake is not in PATH)
 2. Run `.\build\Release\VoxGuard.exe` — verify window opens and meter works
 3. Begin Phase 2: sidetone (mic → output device loopback via miniaudio duplex mode)
 
