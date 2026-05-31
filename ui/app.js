@@ -127,6 +127,24 @@ function recordBreach() {
   document.getElementById('statScore').textContent = score;
 }
 
+// ── Duck target session dropdown ──────────────────────────────────
+const duckTargetSel = document.getElementById('duckTargetSelect');
+
+function populateSessionDropdown(sessions) {
+  duckTargetSel.innerHTML = '<option value="0">All apps</option>';
+  sessions.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value       = s.pid;
+    // Remove .exe suffix for cleaner labels
+    opt.textContent = s.name.replace(/\.exe$/i, '');
+    duckTargetSel.appendChild(opt);
+  });
+}
+
+duckTargetSel?.addEventListener('change', () => {
+  sendMsg({ type: 'setDuckTarget', pid: parseInt(duckTargetSel.value, 10) });
+});
+
 // ── Calibration panel logic ───────────────────────────────────────
 const calibPanel      = document.getElementById('calibPanel');
 const calibTitle      = document.getElementById('calibTitle');
@@ -317,6 +335,7 @@ function onCppMessage(raw) {
         startBtn.textContent = 'Stop';
         startBtn.classList.add('capturing');
         startSessionTimer();
+        sendMsg({ type: 'getAudioSessions' }); // populate duck-target dropdown
       } else {
         setStatus('', 'Capture failed');
       }
@@ -324,6 +343,21 @@ function onCppMessage(raw) {
 
     case 'captureStopped':
       setStatus('active', 'Ready');
+      statusLabel.classList.remove('escalating');
+      break;
+
+    case 'sessionList':
+      populateSessionDropdown(msg.sessions ?? []);
+      break;
+
+    case 'escalation':
+      if (msg.active) {
+        statusLabel.classList.add('escalating');
+        statusLabel.textContent = 'Too Loud!';
+      } else {
+        statusLabel.classList.remove('escalating');
+        statusLabel.textContent = 'Capturing';
+      }
       break;
 
     case 'meter':

@@ -514,6 +514,15 @@ html, body {
 /* Utility */
 .hidden { display: none !important; }
 
+/* Compact select for tight footer space */
+.select--sm { max-width: 120px; font-size: 11px; }
+
+/* Escalation flash on status label */
+.status-label.escalating {
+  color: var(--red);
+  animation: blink 0.6s ease-in-out infinite;
+}
+
 /* ── Loudness badge ───────────────────────────────────────────── */
 
 .loudness-badge {

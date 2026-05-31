@@ -146,14 +146,21 @@ cmake.exe is bundled with VS at the path above — not in PATH by default.
   - UI: calibration panel overlaying main area — step indicator, SVG ring progress, result + summary cards
   - UI: zone legend updates to calibrated thresholds; loudness badge (normal/elevated/tooLoud) shown after calibration
   - Verify: click Calibrate, run both steps, confirm zone legend changes; then Start capture to see loudness badge
-- [ ] **Phase 4** — Auto-duck-while-speaking + escalation duck + chime
+- [x] **Phase 4** — Auto-duck-while-speaking + escalation duck + chime
+  - C++: `RefreshDuckSessions()` enumerates WASAPI render sessions every 2 s; never ducks Discord/audiodg/self
+  - C++: `ApplyDuckVolume(factor)` via `ISimpleAudioVolume::SetMasterVolume` on all target sessions
+  - C++: Proactive duck (speaking detected → smooth attack/release with 0.28/0.06 coefficients)
+  - C++: Escalation state machine (sustained-loud → harder duck + chime + `escalation` bridge msg)
+  - C++: Chime = 200 ms 880 Hz sine burst with cosine fade, mixed into playback callback
+  - UI: Duck-target dropdown (populated from `sessionList` after capture starts); "All apps" default
+  - UI: Status label flashes red "Too Loud!" on escalation event
 - [ ] **Phase 5** — System tray, start-with-Windows, session stats/quiet-score, packaging to .exe
 - [ ] **Phase 6** — DAF toggle, optional overlay meter, adaptive sidetone
 
 ### Next up (start of next session)
 Read this file, then:
-1. Run `.\build\Release\VoxGuard.exe` — Start capture, calibrate, verify loudness badge changes state
-2. Begin Phase 4: auto-duck-while-speaking (proactive, gentle) + escalation duck (reactive, stronger) + chime
+1. Run `.\build\Release\VoxGuard.exe` — Start capture, calibrate, verify loudness badge + duck works
+2. Begin Phase 5: system tray + start-with-Windows toggle + session stats/quiet-score + .exe packaging
 
 ---
 

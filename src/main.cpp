@@ -1,6 +1,6 @@
 /*
  * VoxGuard — Voice-volume coaching tool
- * main.cpp — Phase 0+1+2: Win32/WebView2, bridge, mic capture, dBFS meter, sidetone
+ * main.cpp — Phase 0+1+2+3+4: Win32/WebView2, bridge, capture, sidetone, calibration, ducking
  *
  * Threading model:
  *   UI thread      — Win32 message loop, WebView2 callbacks, all COM calls
@@ -24,6 +24,8 @@
 #include <wrl/client.h>
 #include <wrl/event.h>
 #include <WebView2.h>
+#include <mmdeviceapi.h>   // IMMDeviceEnumerator, eRender, eConsole
+#include <audiopolicy.h>   // IAudioSessionManager2, ISimpleAudioVolume
 #include <string>
 #include <sstream>
 #include <atomic>
@@ -85,6 +87,43 @@ static int   g_loudHead          = 0;
 static int g_avgWindowTicks     = 10;  // 10 × 50 ms = 500 ms rolling average
 static int g_sustainThreshTicks = 40;  // 40 × 50 ms = 2 s to trigger "too loud"
 static int g_sustainCount       = 0;   // consecutive ticks above tooLoud threshold
+
+// ── Duck state (Phase 4) ──────────────────────────────────────────
+// Proactive duck: when speaking detected (avgDbfs >= normalDbfs), smoothly
+// reduce the game's volume so the user hears themselves without shouting.
+static std::atomic<bool>  g_duckEnabled{false};
+static std::atomic<float> g_duckAmount{25.0f};           // 0–80 %
+
+// Escalation duck: fires after sustained-loud + chime; ducks harder.
+static std::atomic<bool>  g_escalDuckEnabled{true};
+static std::atomic<float> g_escalDuckAmount{50.0f};      // 0–80 %
+static bool               g_escalationActive    = false;
+static int                g_escalRecoveryLeft   = 0;
+static constexpr int      ESCAL_RECOVERY_TICKS  = 60;    // 3 s at 50 ms/tick
+
+// Smooth duck approach: attack fast, release slow.
+// Per-tick coefficients for exponential approach:
+//   attack  150 ms → coeff ≈ 1 - e^(-50/150) ≈ 0.28
+//   release 800 ms → coeff ≈ 1 - e^(-50/800) ≈ 0.06
+static constexpr float DUCK_ATTACK  = 0.28f;
+static constexpr float DUCK_RELEASE = 0.06f;
+static float g_duckCurrentVol = 1.0f;   // currently applied volume factor (UI thread only)
+
+// Target process to duck (0 = duck all non-Discord sessions).
+// Updated by "setDuckTarget {pid}" bridge message.
+static DWORD g_duckTargetPid         = 0;
+static int   g_sessionRefreshTick    = 0;  // counter: refresh every 40 ticks = 2 s
+static std::vector<ComPtr<ISimpleAudioVolume>> g_duckSessions;
+
+// ── Chime state ───────────────────────────────────────────────────
+// A short sine-wave burst mixed into the playback callback.
+// The UI thread sets g_chimeFramesLeft; the playback callback decrements it.
+static std::atomic<bool>  g_chimeEnabled{true};
+static std::atomic<float> g_chimeVol{0.3f};   // 0–1
+
+static std::vector<float> g_chimeBuf;          // pre-generated PCM (mono)
+static int                g_chimeTotal = 0;    // frames in chime
+static std::atomic<int>   g_chimeLeft{0};      // frames remaining to play
 
 // ─────────────────────────────────────────────────────────────────
 // Audio — capture callback (real-time thread, no COM, no malloc)
@@ -255,6 +294,25 @@ static void AudioPlaybackCallback(ma_device* /*dev*/,
         // Underrun: output silence (happens briefly on first start or if capture stalls)
         std::memset(out, 0, frameCount * 2 * sizeof(float));
     }
+
+    // ── Mix chime burst into output ───────────────────────────────
+    // The UI thread fires g_chimeLeft = g_chimeTotal to trigger a chime.
+    // We read/decrement atomically; no other thread writes g_chimeLeft while
+    // the playback device is running.
+    int left = g_chimeLeft.load(std::memory_order_relaxed);
+    if (left > 0 && !g_chimeBuf.empty()) {
+        const int   offset = g_chimeTotal - left;
+        const float vol    = g_chimeVol.load(std::memory_order_relaxed);
+        const int   copy   = std::min(left, static_cast<int>(frameCount));
+
+        for (int i = 0; i < copy; ++i) {
+            float s = g_chimeBuf[static_cast<size_t>(offset + i)] * vol;
+            out[i * 2]     = std::max(-1.0f, std::min(1.0f, out[i * 2]     + s));
+            out[i * 2 + 1] = std::max(-1.0f, std::min(1.0f, out[i * 2 + 1] + s));
+        }
+        g_chimeLeft.store(std::max(0, left - static_cast<int>(frameCount)),
+                          std::memory_order_relaxed);
+    }
 }
 
 // Start the sidetone playback device.
@@ -297,6 +355,196 @@ static void StopSidetone()
     ma_device_uninit(&g_playbackDevice);
     g_sidetoneDevActive = false;
     // Leave the ring buffer alive (cheap to keep, avoids re-init cost if re-enabled)
+}
+
+// Forward declaration — defined in the Helpers section below
+static std::wstring JsonEscape(const std::wstring&);
+
+// ─────────────────────────────────────────────────────────────────
+// Phase 4 — Chime generation
+// ─────────────────────────────────────────────────────────────────
+
+// Pre-generate a 200 ms 880 Hz (A5) sine burst with cosine fade-in/out.
+// Called once at startup, before any playback device is started.
+static void GenerateChime()
+{
+    constexpr int   SR      = 48000;
+    constexpr float FREQ    = 880.0f;
+    constexpr float DUR_MS  = 200.0f;
+    const     int   TOTAL   = static_cast<int>(SR * DUR_MS / 1000.0f); // 9600 frames
+    const     int   FADE    = TOTAL / 8;                                 // 25 ms fade
+
+    g_chimeBuf.resize(static_cast<size_t>(TOTAL));
+    for (int i = 0; i < TOTAL; ++i) {
+        float t     = static_cast<float>(i) / SR;
+        float s     = std::sin(2.0f * 3.14159265f * FREQ * t);
+        // Cosine fade envelope avoids clicks
+        float env   = 1.0f;
+        if (i < FADE)
+            env = 0.5f * (1.0f - std::cos(3.14159265f * i / FADE));
+        else if (i >= TOTAL - FADE)
+            env = 0.5f * (1.0f - std::cos(3.14159265f * (TOTAL - i) / FADE));
+        g_chimeBuf[static_cast<size_t>(i)] = s * env;
+    }
+    g_chimeTotal = TOTAL;
+}
+
+// Trigger the chime (UI thread only — sets the atomic that the playback callback reads)
+static void TriggerChime()
+{
+    if (g_chimeEnabled.load() && g_sidetoneDevActive && g_chimeTotal > 0)
+        g_chimeLeft.store(g_chimeTotal, std::memory_order_relaxed);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Phase 4 — WASAPI per-session ducking (UI thread only — COM/STA)
+// ─────────────────────────────────────────────────────────────────
+
+// Returns true if the executable at `pid` contains any of the skip keywords.
+// Used to never duck Discord, audiodg (Windows audio engine), or ourselves.
+static bool ShouldSkipPid(DWORD pid)
+{
+    if (pid == GetCurrentProcessId()) return true;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    wchar_t path[MAX_PATH]{};
+    DWORD   len = MAX_PATH;
+    bool    skip = false;
+    if (QueryFullProcessImageNameW(h, 0, path, &len)) {
+        // Lowercase the filename part for comparison
+        std::wstring name(path, len);
+        for (auto& c : name) c = static_cast<wchar_t>(towlower(c));
+        if (name.find(L"discord")  != std::wstring::npos) skip = true;
+        if (name.find(L"audiodg")  != std::wstring::npos) skip = true;
+        if (name.find(L"voxguard") != std::wstring::npos) skip = true;
+    }
+    CloseHandle(h);
+    return skip;
+}
+
+// Re-enumerate render sessions and cache ISimpleAudioVolume for every target session.
+// Called on the UI thread; cheap enough to run every 2 s.
+static void RefreshDuckSessions()
+{
+    g_duckSessions.clear();
+
+    ComPtr<IMMDeviceEnumerator> devEnum;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), &devEnum)))
+        return;
+
+    ComPtr<IMMDevice> device;
+    if (FAILED(devEnum->GetDefaultAudioEndpoint(eRender, eConsole, &device)))
+        return;
+
+    ComPtr<IAudioSessionManager2> mgr;
+    if (FAILED(device->Activate(__uuidof(IAudioSessionManager2),
+                                CLSCTX_ALL, nullptr, &mgr)))
+        return;
+
+    ComPtr<IAudioSessionEnumerator> sessEnum;
+    if (FAILED(mgr->GetSessionEnumerator(&sessEnum))) return;
+
+    int count = 0;
+    sessEnum->GetCount(&count);
+
+    for (int i = 0; i < count; ++i) {
+        ComPtr<IAudioSessionControl> ctrl;
+        if (FAILED(sessEnum->GetSession(i, &ctrl))) continue;
+
+        ComPtr<IAudioSessionControl2> ctrl2;
+        if (FAILED(ctrl.As(&ctrl2))) continue;
+
+        DWORD pid = 0;
+        ctrl2->GetProcessId(&pid);
+        if (pid == 0) continue;  // skip system/global session
+
+        if (ShouldSkipPid(pid)) continue;
+
+        // If the user picked a specific app, only duck that one
+        if (g_duckTargetPid != 0 && pid != g_duckTargetPid) continue;
+
+        ComPtr<ISimpleAudioVolume> vol;
+        if (SUCCEEDED(ctrl.As(&vol)))
+            g_duckSessions.push_back(std::move(vol));
+    }
+}
+
+// Apply `factor` (0–1) to all cached sessions.
+static void ApplyDuckVolume(float factor)
+{
+    for (auto& vol : g_duckSessions)
+        if (vol) vol->SetMasterVolume(factor, nullptr);
+}
+
+// Restore all sessions to 1.0 and clear the cache.
+static void RestoreDuck()
+{
+    ApplyDuckVolume(1.0f);
+    g_duckSessions.clear();
+    g_duckCurrentVol  = 1.0f;
+    g_escalationActive = false;
+}
+
+// Build JSON array of render session process names for the UI dropdown.
+static std::wstring GetAudioSessionsJson()
+{
+    ComPtr<IMMDeviceEnumerator> devEnum;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+                                CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), &devEnum)))
+        return L"[]";
+
+    ComPtr<IMMDevice> device;
+    if (FAILED(devEnum->GetDefaultAudioEndpoint(eRender, eConsole, &device)))
+        return L"[]";
+
+    ComPtr<IAudioSessionManager2> mgr;
+    if (FAILED(device->Activate(__uuidof(IAudioSessionManager2),
+                                CLSCTX_ALL, nullptr, &mgr)))
+        return L"[]";
+
+    ComPtr<IAudioSessionEnumerator> sessEnum;
+    if (FAILED(mgr->GetSessionEnumerator(&sessEnum))) return L"[]";
+
+    int count = 0;
+    sessEnum->GetCount(&count);
+
+    std::wostringstream json;
+    json << L"[";
+    bool first = true;
+
+    for (int i = 0; i < count; ++i) {
+        ComPtr<IAudioSessionControl> ctrl;
+        if (FAILED(sessEnum->GetSession(i, &ctrl))) continue;
+
+        ComPtr<IAudioSessionControl2> ctrl2;
+        if (FAILED(ctrl.As(&ctrl2))) continue;
+
+        DWORD pid = 0;
+        ctrl2->GetProcessId(&pid);
+        if (pid == 0 || ShouldSkipPid(pid)) continue;
+
+        // Get executable base name
+        std::wstring exeName = L"Unknown";
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (h) {
+            wchar_t path[MAX_PATH]{};
+            DWORD len = MAX_PATH;
+            if (QueryFullProcessImageNameW(h, 0, path, &len)) {
+                std::wstring full(path, len);
+                auto slash = full.rfind(L'\\');
+                exeName = (slash != std::wstring::npos) ? full.substr(slash + 1) : full;
+            }
+            CloseHandle(h);
+        }
+
+        if (!first) json << L",";
+        first = false;
+        json << L"{\"pid\":" << pid
+             << L",\"name\":\"" << JsonEscape(exeName) << L"\"}";
+    }
+    json << L"]";
+    return json.str();
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -359,6 +607,79 @@ static HRESULT HandleJsMessage(ICoreWebView2* wv,
         // JS asked for the list of capture devices
         std::wstring resp = L"{\"type\":\"deviceList\",\"devices\":";
         resp += GetCaptureDevicesJson();
+        resp += L"}";
+        wv->PostWebMessageAsJson(resp.c_str());
+
+    } else if (msg.find(L"\"type\":\"setMaster\"") != std::wstring::npos) {
+        // Master enable/disable (future: pause all processing when off)
+        // For now just acknowledge
+        wv->PostWebMessageAsJson(L"{\"type\":\"masterSet\",\"ok\":true}");
+
+    } else if (msg.find(L"\"type\":\"setDuck\"") != std::wstring::npos) {
+        bool enable = msg.find(L"\"enabled\":true") != std::wstring::npos;
+        g_duckEnabled.store(enable, std::memory_order_relaxed);
+        if (enable) {
+            g_sessionRefreshTick = 40; // force immediate refresh on next tick
+        } else {
+            RestoreDuck();
+        }
+        wv->PostWebMessageAsJson(L"{\"type\":\"duckSet\",\"ok\":true}");
+
+    } else if (msg.find(L"\"type\":\"setDuckAmount\"") != std::wstring::npos) {
+        auto pos = msg.find(L"\"value\":");
+        if (pos != std::wstring::npos) {
+            pos += 8;
+            try {
+                float v = std::stof(msg.substr(pos));
+                g_duckAmount.store(std::max(0.0f, std::min(80.0f, v)),
+                                   std::memory_order_relaxed);
+            } catch (...) {}
+        }
+
+    } else if (msg.find(L"\"type\":\"setDuckTarget\"") != std::wstring::npos) {
+        // {"type":"setDuckTarget","pid":1234}  or  "pid":0 for "all"
+        auto pos = msg.find(L"\"pid\":");
+        if (pos != std::wstring::npos) {
+            pos += 6;
+            try {
+                g_duckTargetPid = static_cast<DWORD>(std::stoul(msg.substr(pos)));
+                g_sessionRefreshTick = 40; // force re-enumerate
+            } catch (...) {}
+        }
+
+    } else if (msg.find(L"\"type\":\"setEscalDuck\"") != std::wstring::npos) {
+        bool en = msg.find(L"\"enabled\":true") != std::wstring::npos;
+        g_escalDuckEnabled.store(en, std::memory_order_relaxed);
+
+    } else if (msg.find(L"\"type\":\"setEscalDuckAmount\"") != std::wstring::npos) {
+        auto pos = msg.find(L"\"value\":");
+        if (pos != std::wstring::npos) {
+            pos += 8;
+            try {
+                float v = std::stof(msg.substr(pos));
+                g_escalDuckAmount.store(std::max(0.0f, std::min(80.0f, v)),
+                                        std::memory_order_relaxed);
+            } catch (...) {}
+        }
+
+    } else if (msg.find(L"\"type\":\"setChime\"") != std::wstring::npos) {
+        bool en = msg.find(L"\"enabled\":true") != std::wstring::npos;
+        g_chimeEnabled.store(en, std::memory_order_relaxed);
+
+    } else if (msg.find(L"\"type\":\"setChimeVolume\"") != std::wstring::npos) {
+        auto pos = msg.find(L"\"value\":");
+        if (pos != std::wstring::npos) {
+            pos += 8;
+            try {
+                float v = std::stof(msg.substr(pos)) / 100.0f;
+                g_chimeVol.store(std::max(0.0f, std::min(1.0f, v)),
+                                 std::memory_order_relaxed);
+            } catch (...) {}
+        }
+
+    } else if (msg.find(L"\"type\":\"getAudioSessions\"") != std::wstring::npos) {
+        std::wstring resp = L"{\"type\":\"sessionList\",\"sessions\":";
+        resp += GetAudioSessionsJson();
         resp += L"}";
         wv->PostWebMessageAsJson(resp.c_str());
 
@@ -504,6 +825,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CREATE:
         // Set g_hwnd BEFORE InitWebView — it uses it as the parent HWND
         g_hwnd = hwnd;
+        GenerateChime();  // pre-generate chime PCM before the playback device starts
         InitWebView(GetExeDir() + L"\\ui\\index.html");
         return 0;
 
@@ -598,11 +920,68 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_webview->PostWebMessageAsJson(buf);
         }
 
+        // ── 5. Auto-duck logic ────────────────────────────────────
+        if (g_duckEnabled.load() && g_calibrated) {
+            // Refresh the session list every 2 s (40 ticks) so new game
+            // sessions are picked up without restarting VoxGuard.
+            if (++g_sessionRefreshTick >= 40) {
+                g_sessionRefreshTick = 0;
+                RefreshDuckSessions();
+                // Immediately apply the current volume to any newly found sessions
+                ApplyDuckVolume(g_duckCurrentVol);
+            }
+
+            bool isSpeaking  = (avgDbfs >= g_normalDbfs);
+            bool isEscalated = (g_sustainCount >= g_sustainThreshTicks);
+
+            // Escalation state machine
+            if (isEscalated && !g_escalationActive) {
+                g_escalationActive  = true;
+                g_escalRecoveryLeft = ESCAL_RECOVERY_TICKS;
+                TriggerChime();
+                g_webview->PostWebMessageAsJson(
+                    L"{\"type\":\"escalation\",\"active\":true}");
+
+            } else if (g_escalationActive) {
+                if (!isEscalated) {
+                    if (--g_escalRecoveryLeft <= 0) {
+                        g_escalationActive = false;
+                        g_webview->PostWebMessageAsJson(
+                            L"{\"type\":\"escalation\",\"active\":false}");
+                    }
+                } else {
+                    g_escalRecoveryLeft = ESCAL_RECOVERY_TICKS; // reset while still loud
+                }
+            }
+
+            // Compute target volume
+            float targetVol = 1.0f;
+            if (isSpeaking) {
+                float amt = g_duckAmount.load() / 100.0f;          // e.g. 0.25
+                targetVol = 1.0f - amt;                             // e.g. 0.75
+            }
+            if (g_escalationActive && g_escalDuckEnabled.load()) {
+                float amt = g_escalDuckAmount.load() / 100.0f;     // e.g. 0.50
+                targetVol = std::min(targetVol, 1.0f - amt);        // e.g. 0.50
+            }
+
+            // Exponential smooth approach: attack fast, release slow
+            float coeff = (targetVol < g_duckCurrentVol) ? DUCK_ATTACK : DUCK_RELEASE;
+            g_duckCurrentVol += (targetVol - g_duckCurrentVol) * coeff;
+
+            ApplyDuckVolume(g_duckCurrentVol);
+
+        } else if (!g_duckEnabled.load() && g_duckCurrentVol < 0.99f) {
+            // Duck was just disabled — restore immediately
+            RestoreDuck();
+        }
+
         return 0;
     }
 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
+        RestoreDuck();         // put the game volume back before we exit
         StopSidetone();
         if (g_sidetoneRbReady) {
             ma_pcm_rb_uninit(&g_sidetoneRb);
