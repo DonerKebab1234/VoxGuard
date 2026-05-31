@@ -352,12 +352,17 @@ function onCppMessage(raw) {
 
     case 'escalation':
       if (msg.active) {
+        recordBreach();  // one breach per escalation event, not per tick
         statusLabel.classList.add('escalating');
         statusLabel.textContent = 'Too Loud!';
       } else {
         statusLabel.classList.remove('escalating');
         statusLabel.textContent = 'Capturing';
       }
+      break;
+
+    case 'startWithWindows':
+      document.getElementById('startWithWindows').checked = !!msg.enabled;
       break;
 
     case 'meter':
@@ -378,7 +383,7 @@ function onCppMessage(raw) {
 
     case 'loudnessState':
       updateLoudnessState(msg.state);
-      if (msg.state === 'tooLoud') recordBreach();
+      // Breaches counted via 'escalation' event, not every tooLoud tick
       break;
   }
 }
@@ -387,7 +392,7 @@ function onCppMessage(raw) {
 if (bridge) {
   setStatus('connecting', 'Connecting…');
   bridge.addEventListener('message', e => onCppMessage(e.data));
-  sendMsg({ type: 'ping' });
+  sendMsg({ type: 'ping' });        // pong includes startWithWindows state
   sendMsg({ type: 'getDevices' });
 } else {
   // Browser preview mode — fake moving meter + fake calibration
@@ -463,4 +468,7 @@ document.getElementById('duckEnable')?.addEventListener('change', e => {
 });
 document.getElementById('masterEnable')?.addEventListener('change', e => {
   sendMsg({ type: 'setMaster', enabled: e.target.checked });
+});
+document.getElementById('startWithWindows')?.addEventListener('change', e => {
+  sendMsg({ type: 'setStartWithWindows', enabled: e.target.checked });
 });

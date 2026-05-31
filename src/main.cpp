@@ -26,6 +26,7 @@
 #include <WebView2.h>
 #include <mmdeviceapi.h>   // IMMDeviceEnumerator, eRender, eConsole
 #include <audiopolicy.h>   // IAudioSessionManager2, ISimpleAudioVolume
+#include <shellapi.h>      // Shell_NotifyIcon — system tray
 #include <string>
 #include <sstream>
 #include <atomic>
@@ -123,7 +124,17 @@ static std::atomic<float> g_chimeVol{0.3f};   // 0–1
 
 static std::vector<float> g_chimeBuf;          // pre-generated PCM (mono)
 static int                g_chimeTotal = 0;    // frames in chime
-static std::atomic<int>   g_chimeLeft{0};      // frames remaining to play
+static std::atomic<int>   g_chimeLeft{0};
+
+// ── System tray (Phase 5) ─────────────────────────────────────────
+#define WM_TRAYICON  (WM_USER + 1)
+#define ID_TRAY_SHOW  1001
+#define ID_TRAY_QUIT  1002
+
+static NOTIFYICONDATAW g_nid{};   // explicit W variant; NOTIFYICONDATA is ANSI under WIN32_LEAN_AND_MEAN
+static HMENU          g_trayMenu    = nullptr;
+static bool           g_hiddenToTray = false;  // true while window is hidden in tray
+static bool           g_startMinimized = false; // set from /minimized command-line flag      // frames remaining to play
 
 // ─────────────────────────────────────────────────────────────────
 // Audio — capture callback (real-time thread, no COM, no malloc)
@@ -355,6 +366,99 @@ static void StopSidetone()
     ma_device_uninit(&g_playbackDevice);
     g_sidetoneDevActive = false;
     // Leave the ring buffer alive (cheap to keep, avoids re-init cost if re-enabled)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Phase 5 — System tray
+// ─────────────────────────────────────────────────────────────────
+
+static void TrayUpdateTip(const wchar_t* tip)
+{
+    wcscpy_s(g_nid.szTip, _countof(g_nid.szTip), tip);
+    g_nid.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+static void TrayCreate(HINSTANCE hInst)
+{
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize           = sizeof(NOTIFYICONDATAW);
+    g_nid.hWnd             = g_hwnd;
+    g_nid.uID              = 1;
+    g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon            = LoadIcon(hInst, IDI_APPLICATION);
+    wcscpy_s(g_nid.szTip, _countof(g_nid.szTip), L"VoxGuard");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+
+    g_trayMenu = CreatePopupMenu();
+    AppendMenuW(g_trayMenu, MF_STRING,    ID_TRAY_SHOW, L"Show VoxGuard");
+    AppendMenuW(g_trayMenu, MF_SEPARATOR, 0,            nullptr);
+    AppendMenuW(g_trayMenu, MF_STRING,    ID_TRAY_QUIT, L"Quit");
+}
+
+static void TrayDestroy()
+{
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    if (g_trayMenu) { DestroyMenu(g_trayMenu); g_trayMenu = nullptr; }
+}
+
+static void TrayShowMenu()
+{
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(g_hwnd);     // required so menu dismisses on outside click
+    TrackPopupMenu(g_trayMenu,
+                   TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RIGHTBUTTON,
+                   pt.x, pt.y, 0, g_hwnd, nullptr);
+    PostMessageW(g_hwnd, WM_NULL, 0, 0); // flush after SetForegroundWindow trick
+}
+
+static void TrayRestoreWindow()
+{
+    ShowWindow(g_hwnd, SW_RESTORE);
+    SetForegroundWindow(g_hwnd);
+    g_hiddenToTray = false;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Phase 5 — Start-with-Windows (HKCU Run key)
+// ─────────────────────────────────────────────────────────────────
+
+static const wchar_t* RUN_KEY =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* RUN_VALUE = L"VoxGuard";
+
+static bool GetStartWithWindows()
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &key)
+        != ERROR_SUCCESS)
+        return false;
+    bool exists = (RegQueryValueExW(key, RUN_VALUE, nullptr, nullptr,
+                                    nullptr, nullptr) == ERROR_SUCCESS);
+    RegCloseKey(key);
+    return exists;
+}
+
+static void SetStartWithWindows(bool enable)
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_WRITE, &key)
+        != ERROR_SUCCESS)
+        return;
+    if (enable) {
+        wchar_t path[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        // /minimized → starts hidden to tray, audio runs silently
+        std::wstring val = std::wstring(L"\"") + path + L"\" /minimized";
+        RegSetValueExW(key, RUN_VALUE, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(val.c_str()),
+                       static_cast<DWORD>((val.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(key, RUN_VALUE);
+    }
+    RegCloseKey(key);
 }
 
 // Forward declaration — defined in the Helpers section below
@@ -600,8 +704,13 @@ static HRESULT HandleJsMessage(ICoreWebView2* wv,
 
     // Simple type-based dispatch — Phase 0 uses "ping", Phase 1 adds "startCapture"
     if (msg.find(L"\"type\":\"ping\"") != std::wstring::npos) {
-        // Bridge round-trip test
-        wv->PostWebMessageAsJson(L"{\"type\":\"pong\",\"ok\":true}");
+        // Pong + send initial state so the UI can sync toggles on load
+        bool sww = GetStartWithWindows();
+        wchar_t pong[128];
+        swprintf_s(pong,
+            L"{\"type\":\"pong\",\"ok\":true,\"startWithWindows\":%s}",
+            sww ? L"true" : L"false");
+        wv->PostWebMessageAsJson(pong);
 
     } else if (msg.find(L"\"type\":\"getDevices\"") != std::wstring::npos) {
         // JS asked for the list of capture devices
@@ -609,6 +718,21 @@ static HRESULT HandleJsMessage(ICoreWebView2* wv,
         resp += GetCaptureDevicesJson();
         resp += L"}";
         wv->PostWebMessageAsJson(resp.c_str());
+
+    } else if (msg.find(L"\"type\":\"getStartWithWindows\"") != std::wstring::npos) {
+        bool on = GetStartWithWindows();
+        wv->PostWebMessageAsJson(on
+            ? L"{\"type\":\"startWithWindows\",\"enabled\":true}"
+            : L"{\"type\":\"startWithWindows\",\"enabled\":false}");
+
+    } else if (msg.find(L"\"type\":\"setStartWithWindows\"") != std::wstring::npos) {
+        bool enable = msg.find(L"\"enabled\":true") != std::wstring::npos;
+        SetStartWithWindows(enable);
+        wv->PostWebMessageAsJson(L"{\"type\":\"startWithWindowsSet\",\"ok\":true}");
+
+    } else if (msg.find(L"\"type\":\"minimizeToTray\"") != std::wstring::npos) {
+        ShowWindow(g_hwnd, SW_HIDE);
+        g_hiddenToTray = true;
 
     } else if (msg.find(L"\"type\":\"setMaster\"") != std::wstring::npos) {
         // Master enable/disable (future: pause all processing when off)
@@ -822,11 +946,42 @@ static void InitWebView(std::wstring htmlFilePath)
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
-    case WM_CREATE:
+    case WM_CREATE: {
         // Set g_hwnd BEFORE InitWebView — it uses it as the parent HWND
         g_hwnd = hwnd;
-        GenerateChime();  // pre-generate chime PCM before the playback device starts
+        GenerateChime();
+        // Tray icon is created from WinMain after we have the HINSTANCE
         InitWebView(GetExeDir() + L"\\ui\\index.html");
+        return 0;
+    }
+
+    case WM_CLOSE:
+        // Hide to tray instead of destroying — audio keeps running
+        ShowWindow(hwnd, SW_HIDE);
+        g_hiddenToTray = true;
+        return 0;  // skip DefWindowProcW (which would call DestroyWindow)
+
+    case WM_TRAYICON:
+        switch (LOWORD(lp)) {
+        case WM_RBUTTONUP:
+            TrayShowMenu();
+            break;
+        case WM_LBUTTONDBLCLK:
+            TrayRestoreWindow();
+            break;
+        }
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case ID_TRAY_SHOW:
+            TrayRestoreWindow();
+            break;
+        case ID_TRAY_QUIT:
+            TrayDestroy();
+            DestroyWindow(hwnd);
+            break;
+        }
         return 0;
 
     case WM_SIZE:
@@ -981,7 +1136,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
-        RestoreDuck();         // put the game volume back before we exit
+        TrayDestroy();
+        RestoreDuck();
         StopSidetone();
         if (g_sidetoneRbReady) {
             ma_pcm_rb_uninit(&g_sidetoneRb);
@@ -1003,6 +1159,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
 {
+    // Parse /minimized command-line flag (set by the start-with-Windows registry entry)
+    {
+        int     argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        for (int i = 1; i < argc; ++i)
+            if (_wcsicmp(argv[i], L"/minimized") == 0) g_startMinimized = true;
+        LocalFree(argv);
+    }
+
     // STA required by WebView2 (and COM in general for UI threads)
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
@@ -1018,15 +1183,24 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
     g_hwnd = CreateWindowExW(
         0,
         L"VoxGuardWindow",
-        L"VoxGuard — Voice Coach",   // em-dash
+        L"VoxGuard — Voice Coach",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         960, 680,
         nullptr, nullptr, hInst, nullptr
     );
 
-    ShowWindow(g_hwnd, nCmdShow);
-    UpdateWindow(g_hwnd);
+    // Tray icon must be created after the HWND exists (WM_CREATE already fired)
+    TrayCreate(hInst);
+
+    if (g_startMinimized) {
+        // Start silently in tray — audio is not running yet, will auto-start
+        // only if the user opens the window. (Future: auto-start audio option.)
+        g_hiddenToTray = true;
+    } else {
+        ShowWindow(g_hwnd, nCmdShow);
+        UpdateWindow(g_hwnd);
+    }
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0)) {

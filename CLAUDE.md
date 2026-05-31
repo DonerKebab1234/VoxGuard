@@ -154,13 +154,20 @@ cmake.exe is bundled with VS at the path above — not in PATH by default.
   - C++: Chime = 200 ms 880 Hz sine burst with cosine fade, mixed into playback callback
   - UI: Duck-target dropdown (populated from `sessionList` after capture starts); "All apps" default
   - UI: Status label flashes red "Too Loud!" on escalation event
-- [ ] **Phase 5** — System tray, start-with-Windows, session stats/quiet-score, packaging to .exe
+- [x] **Phase 5** — System tray, start-with-Windows, session stats/quiet-score, packaging to .exe
+  - C++: `Shell_NotifyIcon` tray icon always present; WM_CLOSE hides to tray instead of quitting
+  - C++: Right-click tray menu → Show / Quit; double-click → restore window
+  - C++: HKCU Run key written/removed by `SetStartWithWindows()`; `/minimized` flag starts hidden
+  - C++: Pong response includes `startWithWindows` state so UI toggle initialises correctly
+  - UI: Startup toggle in footer wired to `setStartWithWindows`; fix breach counting to use escalation events
+  - Packaging: zip `build\Release\` (VoxGuard.exe + ui\) — WebView2 runtime ships with Windows 11/Edge
 - [ ] **Phase 6** — DAF toggle, optional overlay meter, adaptive sidetone
 
 ### Next up (start of next session)
 Read this file, then:
 1. Run `.\build\Release\VoxGuard.exe` — Start capture, calibrate, verify loudness badge + duck works
-2. Begin Phase 5: system tray + start-with-Windows toggle + session stats/quiet-score + .exe packaging
+2. Ship to brother: zip `build\Release\` (VoxGuard.exe + ui\) — he just extracts and runs
+3. Begin Phase 6 if desired: DAF toggle, adaptive sidetone, always-on-top overlay meter
 
 ---
 
