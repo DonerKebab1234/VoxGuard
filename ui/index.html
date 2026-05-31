@@ -35,10 +35,9 @@
   </header>
 
   <!-- ── Main: meter hero + stats ───────────────── -->
-  <main class="main">
+  <main class="main" id="mainArea">
 
     <section class="meter-section">
-      <!-- Scale ticks left of bar -->
       <div class="meter-scale">
         <span>0</span>
         <span>-6</span>
@@ -49,8 +48,6 @@
         <span>-48</span>
         <span>-60</span>
       </div>
-
-      <!-- The bar itself -->
       <div class="meter-bar-wrap">
         <div class="meter-bar" id="meterBar"></div>
         <div class="meter-peak" id="meterPeak"></div>
@@ -63,10 +60,26 @@
         <div class="readout-unit">dBFS</div>
       </div>
 
-      <div class="zone-legend">
-        <div class="zone-item green"><span class="zone-bar"></span>Normal  <span class="zone-range">below −12</span></div>
-        <div class="zone-item yellow"><span class="zone-bar"></span>Elevated <span class="zone-range">−12 to −6</span></div>
-        <div class="zone-item red"><span class="zone-bar"></span>Too Loud <span class="zone-range">above −6</span></div>
+      <!-- Zone legend — updates from calibration data once calibrated -->
+      <div class="zone-legend" id="zoneLegend">
+        <div class="zone-item green">
+          <span class="zone-bar"></span>Normal
+          <span class="zone-range" id="zoneGreenRange">below −12</span>
+        </div>
+        <div class="zone-item yellow">
+          <span class="zone-bar"></span>Elevated
+          <span class="zone-range" id="zoneYellowRange">−12 to −6</span>
+        </div>
+        <div class="zone-item red">
+          <span class="zone-bar"></span>Too Loud
+          <span class="zone-range" id="zoneRedRange">above −6</span>
+        </div>
+      </div>
+
+      <!-- Loudness state badge — visible after calibration -->
+      <div class="loudness-badge hidden" id="loudnessBadge">
+        <span class="badge-dot"></span>
+        <span class="badge-label" id="loudnessBadgeLabel">Normal</span>
       </div>
 
       <div class="session-stats">
@@ -84,6 +97,70 @@
         </div>
       </div>
     </section>
+
+    <!-- ── Calibration panel (overlays main area) ── -->
+    <div class="calib-panel hidden" id="calibPanel">
+      <div class="calib-card">
+
+        <!-- Step indicator -->
+        <div class="calib-steps">
+          <div class="calib-step-dot active" id="calibDot1">1</div>
+          <div class="calib-step-line" id="calibStepLine"></div>
+          <div class="calib-step-dot" id="calibDot2">2</div>
+        </div>
+
+        <h2 class="calib-title" id="calibTitle">Normal Voice</h2>
+        <p class="calib-desc" id="calibDesc">
+          Speak at your normal gaming volume. Click Start when ready.
+        </p>
+
+        <!-- Measurement ring -->
+        <div class="calib-ring-wrap">
+          <svg class="calib-ring" viewBox="0 0 120 120" fill="none">
+            <!-- Track -->
+            <circle cx="60" cy="60" r="50" stroke-width="6" stroke="var(--surface-3)"/>
+            <!-- Progress arc — stroke-dashoffset animated by JS -->
+            <circle class="ring-arc" id="calibRingArc"
+                    cx="60" cy="60" r="50"
+                    stroke-width="6"
+                    stroke-linecap="round"
+                    stroke-dasharray="314.159"
+                    stroke-dashoffset="314.159"
+                    transform="rotate(-90 60 60)"/>
+          </svg>
+          <div class="calib-ring-inner">
+            <div class="calib-countdown" id="calibCountdown">5.0</div>
+            <div class="calib-live" id="calibLive">–</div>
+          </div>
+        </div>
+
+        <!-- Result row (shown after measurement completes) -->
+        <div class="calib-result hidden" id="calibResult">
+          <span class="calib-result-label" id="calibResultLabel">Measured</span>
+          <span class="calib-result-value" id="calibResultValue">–</span>
+          <span class="calib-result-unit">dBFS</span>
+        </div>
+
+        <!-- Summary row (shown after both steps complete) -->
+        <div class="calib-summary hidden" id="calibSummary">
+          <div class="calib-summary-item">
+            <span class="calib-summary-label">Normal</span>
+            <span class="calib-summary-val" id="summaryNormal">–</span>
+          </div>
+          <div class="calib-summary-sep">→</div>
+          <div class="calib-summary-item">
+            <span class="calib-summary-label">Too Loud</span>
+            <span class="calib-summary-val" id="summaryTooLoud">–</span>
+          </div>
+        </div>
+
+        <div class="calib-actions">
+          <button class="btn-primary" id="calibActionBtn">Start Measurement</button>
+          <button class="btn-text" id="calibCancelBtn">Cancel</button>
+        </div>
+
+      </div>
+    </div>
 
   </main>
 

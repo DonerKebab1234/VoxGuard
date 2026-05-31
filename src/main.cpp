@@ -27,6 +27,7 @@
 #include <string>
 #include <sstream>
 #include <atomic>
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -60,6 +61,30 @@ static bool               g_sidetoneDevActive  = false;
 
 static std::atomic<bool>  g_sidetoneEnabled{false};
 static std::atomic<float> g_sidetoneGain{0.4f};  // 0–1; default 40%
+
+// ── Calibration state ─────────────────────────────────────────────
+enum class CalibState { Idle, Step1, Step2 };
+static CalibState         g_calibState     = CalibState::Idle;
+static int                g_calibTicksLeft = 0;       // 50 ms ticks remaining in step
+static std::vector<float> g_calibSamples;              // dBFS readings collected so far
+
+// Thresholds in dBFS.  Defaults are reasonable for a typical headset mic;
+// calibration replaces these with values derived from the user's actual voice.
+static float g_normalDbfs  = -30.0f;  // start of "speaking" zone
+static float g_tooLoudDbfs = -15.0f;  // start of "too loud" zone
+static bool  g_calibrated  = false;
+
+// ── Sustained-loudness window ─────────────────────────────────────
+// Circular buffer of dBFS readings, one per WM_TIMER tick (50 ms).
+// 200 slots × 50 ms = 10 s of history.
+static constexpr int LOUD_BUF = 200;
+static float g_loudBuf[LOUD_BUF] = {};
+static int   g_loudHead          = 0;
+
+// Configurable (can be updated via bridge messages in later phases):
+static int g_avgWindowTicks     = 10;  // 10 × 50 ms = 500 ms rolling average
+static int g_sustainThreshTicks = 40;  // 40 × 50 ms = 2 s to trigger "too loud"
+static int g_sustainCount       = 0;   // consecutive ticks above tooLoud threshold
 
 // ─────────────────────────────────────────────────────────────────
 // Audio — capture callback (real-time thread, no COM, no malloc)
@@ -362,6 +387,44 @@ static HRESULT HandleJsMessage(ICoreWebView2* wv,
             } catch (...) {}
         }
 
+    } else if (msg.find(L"\"type\":\"stopCapture\"") != std::wstring::npos) {
+        if (g_audioActive) {
+            g_calibState = CalibState::Idle;
+            ma_device_uninit(&g_captureDevice);
+            g_audioActive = false;
+        }
+        wv->PostWebMessageAsJson(L"{\"type\":\"captureStopped\",\"ok\":true}");
+
+    } else if (msg.find(L"\"type\":\"calibrate\"") != std::wstring::npos) {
+        // {"type":"calibrate","step":1}  or  step:2
+        int step = 1;
+        auto pos = msg.find(L"\"step\":");
+        if (pos != std::wstring::npos) {
+            pos += 7;
+            while (pos < msg.size() && msg[pos] == L' ') ++pos;
+            try { step = std::stoi(msg.substr(pos)); } catch (...) {}
+        }
+        g_calibSamples.clear();
+        g_calibSamples.reserve(120);
+        g_calibTicksLeft = 100; // 5 s × 20 ticks/s
+        g_calibState     = (step == 2) ? CalibState::Step2 : CalibState::Step1;
+        wv->PostWebMessageAsJson(L"{\"type\":\"calibStarted\",\"ok\":true}");
+
+    } else if (msg.find(L"\"type\":\"setThresholds\"") != std::wstring::npos) {
+        // Manual override: {"type":"setThresholds","normal":-25,"tooLoud":-12}
+        auto p1 = msg.find(L"\"normal\":");
+        if (p1 != std::wstring::npos) {
+            p1 += 9;
+            try { g_normalDbfs = std::stof(msg.substr(p1)); } catch (...) {}
+        }
+        auto p2 = msg.find(L"\"tooLoud\":");
+        if (p2 != std::wstring::npos) {
+            p2 += 10;
+            try { g_tooLoudDbfs = std::stof(msg.substr(p2)); } catch (...) {}
+        }
+        g_calibrated = true;
+        wv->PostWebMessageAsJson(L"{\"type\":\"thresholdsSet\",\"ok\":true}");
+
     } else if (msg.find(L"\"type\":\"startCapture\"") != std::wstring::npos) {
         // JS asked to start capture on a device index
         // Parse "deviceIndex": N  (simple manual parse — no JSON lib needed)
@@ -448,15 +511,95 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         ResizeWebView();
         return 0;
 
-    case WM_TIMER:
-        // Push current dBFS reading to JS for the live meter
-        if (g_webview && g_audioActive) {
-            wchar_t buf[64];
-            swprintf_s(buf, L"{\"type\":\"meter\",\"dbfs\":%.1f}",
-                       g_currentDbfs.load(std::memory_order_relaxed));
+    case WM_TIMER: {
+        if (!g_webview || !g_audioActive) return 0;
+
+        float    dbfs = g_currentDbfs.load(std::memory_order_relaxed);
+        wchar_t  buf[256];
+
+        // ── 1. Instantaneous meter ───────────────────────────────
+        swprintf_s(buf, L"{\"type\":\"meter\",\"dbfs\":%.1f}", dbfs);
+        g_webview->PostWebMessageAsJson(buf);
+
+        // ── 2. Rolling average (store linear power, average, convert back) ──
+        // Averaging dBFS directly is an approximation; this is close enough
+        // for a coaching tool operating in a narrow 60 dB range.
+        g_loudBuf[g_loudHead] = dbfs;
+        g_loudHead = (g_loudHead + 1) % LOUD_BUF;
+
+        int   win   = std::max(1, std::min(g_avgWindowTicks, LOUD_BUF));
+        float wsum  = 0.0f;
+        int   wStart = (g_loudHead - win + LOUD_BUF) % LOUD_BUF;
+        for (int i = 0; i < win; ++i)
+            wsum += g_loudBuf[(wStart + i) % LOUD_BUF];
+        float avgDbfs = wsum / win;
+
+        // ── 3. Calibration countdown ─────────────────────────────
+        if (g_calibState != CalibState::Idle && g_calibTicksLeft > 0) {
+            // Skip near-silence readings (mic not yet speaking)
+            if (dbfs > -55.0f) g_calibSamples.push_back(dbfs);
+            --g_calibTicksLeft;
+
+            constexpr int TOTAL_TICKS = 100; // 5 s / 50 ms
+            float progress = 1.0f - static_cast<float>(g_calibTicksLeft) / TOTAL_TICKS;
+            int   step     = (g_calibState == CalibState::Step1) ? 1 : 2;
+
+            swprintf_s(buf,
+                L"{\"type\":\"calibProgress\",\"step\":%d,"
+                L"\"progress\":%.3f,\"dbfs\":%.1f,\"ticksLeft\":%d}",
+                step, progress, dbfs, g_calibTicksLeft);
+            g_webview->PostWebMessageAsJson(buf);
+
+            if (g_calibTicksLeft == 0) {
+                // Compute mean of collected samples
+                float s = 0.0f;
+                for (float v : g_calibSamples) s += v;
+                float avg = g_calibSamples.empty() ? -30.0f
+                                                   : s / static_cast<float>(g_calibSamples.size());
+
+                if (g_calibState == CalibState::Step1) {
+                    g_normalDbfs = avg;
+                    swprintf_s(buf,
+                        L"{\"type\":\"calibDone\",\"step\":1,\"dbfs\":%.1f}", avg);
+                } else {
+                    // Clamp: tooLoud must be at least 3 dB above normal
+                    g_tooLoudDbfs = std::max(avg, g_normalDbfs + 3.0f);
+                    g_calibrated  = true;
+                    swprintf_s(buf,
+                        L"{\"type\":\"calibDone\",\"step\":2,\"dbfs\":%.1f,"
+                        L"\"normalDbfs\":%.1f,\"tooLoudDbfs\":%.1f}",
+                        avg, g_normalDbfs, g_tooLoudDbfs);
+                }
+                g_webview->PostWebMessageAsJson(buf);
+                g_calibState = CalibState::Idle;
+                g_calibSamples.clear();
+            }
+        }
+
+        // ── 4. Loudness state (only meaningful after calibration) ─
+        if (g_calibrated) {
+            // Ramp up faster than ramp-down: single shout shouldn't sustain,
+            // but sustained shouting should escalate quickly.
+            if (avgDbfs >= g_tooLoudDbfs)
+                g_sustainCount = std::min(g_sustainCount + 1,
+                                          g_sustainThreshTicks + 20);
+            else
+                g_sustainCount = std::max(0, g_sustainCount - 2);
+
+            const wchar_t* state =
+                (g_sustainCount >= g_sustainThreshTicks) ? L"tooLoud" :
+                (avgDbfs >= g_normalDbfs)                ? L"elevated" :
+                                                           L"normal";
+
+            swprintf_s(buf,
+                L"{\"type\":\"loudnessState\",\"state\":\"%s\","
+                L"\"avg\":%.1f,\"sustained\":%d,\"sustainThresh\":%d}",
+                state, avgDbfs, g_sustainCount, g_sustainThreshTicks);
             g_webview->PostWebMessageAsJson(buf);
         }
+
         return 0;
+    }
 
     case WM_DESTROY:
         KillTimer(hwnd, 1);

@@ -139,15 +139,21 @@ cmake.exe is bundled with VS at the path above — not in PATH by default.
   - `g_sidetoneEnabled` / `g_sidetoneGain` atomics; `StartSidetone()` / `StopSidetone()`
   - Bridge: `setSidetone {enabled}` and `setSidetoneLevel {value: 0–100}` both wired
   - Verify: Start capture, toggle Sidetone ON in footer — you should hear yourself in headphones
-- [ ] **Phase 3** — Calibration flow (2-step), derive normal/too-loud thresholds, sustained-loudness window
+- [x] **Phase 3** — Calibration flow (2-step), derive normal/too-loud thresholds, sustained-loudness window
+  - C++: `CalibState` enum, 100-tick countdown (5 s), mean dBFS from non-silent samples → `g_normalDbfs` / `g_tooLoudDbfs`
+  - C++: 200-entry circular buffer, rolling average over configurable window, `g_sustainCount` ramp logic
+  - C++: sends `calibProgress`, `calibDone`, `loudnessState` bridge messages from WM_TIMER
+  - UI: calibration panel overlaying main area — step indicator, SVG ring progress, result + summary cards
+  - UI: zone legend updates to calibrated thresholds; loudness badge (normal/elevated/tooLoud) shown after calibration
+  - Verify: click Calibrate, run both steps, confirm zone legend changes; then Start capture to see loudness badge
 - [ ] **Phase 4** — Auto-duck-while-speaking + escalation duck + chime
 - [ ] **Phase 5** — System tray, start-with-Windows, session stats/quiet-score, packaging to .exe
 - [ ] **Phase 6** — DAF toggle, optional overlay meter, adaptive sidetone
 
 ### Next up (start of next session)
 Read this file, then:
-1. Run `.\build\Release\VoxGuard.exe` — click Start, toggle Sidetone ON, verify you hear yourself
-2. Begin Phase 3: calibration flow (2-step guided, 5s each) + threshold derivation + sustained-loudness window
+1. Run `.\build\Release\VoxGuard.exe` — Start capture, calibrate, verify loudness badge changes state
+2. Begin Phase 4: auto-duck-while-speaking (proactive, gentle) + escalation duck (reactive, stronger) + chime
 
 ---
 
