@@ -28,6 +28,7 @@
 #include <mmdeviceapi.h>   // IMMDeviceEnumerator, eRender, eConsole
 #include <audiopolicy.h>   // IAudioSessionManager2, ISimpleAudioVolume
 #include <shellapi.h>      // Shell_NotifyIcon — system tray
+#include <shlobj.h>        // SHGetKnownFolderPath, FOLDERID_Desktop, IShellLinkW
 #include <string>
 #include <sstream>
 #include <atomic>
@@ -1379,6 +1380,67 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 // ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+// First-run: desktop shortcut prompt
+// ─────────────────────────────────────────────────────────────────
+
+// Returns true if this is the very first launch (no registry marker yet).
+static bool IsFirstRun()
+{
+    HKEY hKey;
+    LONG res = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\VoxGuard",
+                             0, KEY_READ, &hKey);
+    if (res == ERROR_SUCCESS) { RegCloseKey(hKey); return false; }
+    return true;  // key absent → never run before
+}
+
+// Writes the registry marker so we only prompt once.
+static void MarkFirstRunDone()
+{
+    HKEY hKey;
+    RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\VoxGuard",
+                    0, nullptr, REG_OPTION_NON_VOLATILE,
+                    KEY_WRITE, nullptr, &hKey, nullptr);
+    DWORD val = 1;
+    RegSetValueExW(hKey, L"FirstRunDone", 0, REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&val), sizeof(val));
+    RegCloseKey(hKey);
+}
+
+// Creates VoxGuard.lnk on the user's desktop pointing at this exe.
+static void CreateDesktopShortcut()
+{
+    // Get the path of the running exe
+    wchar_t exePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
+    // Get the desktop folder path
+    PWSTR desktopPath = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktopPath)))
+        return;
+    std::wstring lnkPath = std::wstring(desktopPath) + L"\\VoxGuard.lnk";
+    CoTaskMemFree(desktopPath);
+
+    // Create the shell link COM object
+    IShellLinkW* pLink = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_IShellLinkW, reinterpret_cast<void**>(&pLink))))
+        return;
+
+    pLink->SetPath(exePath);
+    pLink->SetDescription(L"VoxGuard — Voice Volume Coach");
+    pLink->SetIconLocation(exePath, 0);
+
+    // Save the .lnk file via IPersistFile
+    IPersistFile* pFile = nullptr;
+    if (SUCCEEDED(pLink->QueryInterface(IID_IPersistFile,
+                                        reinterpret_cast<void**>(&pFile)))) {
+        pFile->Save(lnkPath.c_str(), TRUE);
+        pFile->Release();
+    }
+    pLink->Release();
+}
+
 // Entry Point
 // ─────────────────────────────────────────────────────────────────
 
@@ -1425,6 +1487,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow)
     } else {
         ShowWindow(g_hwnd, nCmdShow);
         UpdateWindow(g_hwnd);
+    }
+
+    // First-run: offer a desktop shortcut (only shows once, ever).
+    if (IsFirstRun()) {
+        MarkFirstRunDone();  // mark done first so a crash doesn't loop the prompt
+        int answer = MessageBoxW(
+            g_hwnd,
+            L"Would you like a shortcut for VoxGuard on your desktop?",
+            L"VoxGuard — First Launch",
+            MB_YESNO | MB_ICONQUESTION
+        );
+        if (answer == IDYES) CreateDesktopShortcut();
     }
 
     MSG message{};
