@@ -27,10 +27,16 @@ if(NOT EXISTS "${MINIAUDIO_INCLUDE_DIR}/miniaudio.h")
   )
 endif()
 
+# ── Generate .rc with absolute paths to UI source files ────────────
+# The template uses @CMAKE_SOURCE_DIR@ so rc.exe can find the files
+# regardless of the build working directory.
+configure_file(voxguard.rc.in "${CMAKE_BINARY_DIR}/voxguard.rc" @ONLY)
+
 # ── Main executable ────────────────────────────────────────────────
 # WIN32 suppresses the console window (this is a GUI app)
 add_executable(VoxGuard WIN32
   src/main.cpp
+  "${CMAKE_BINARY_DIR}/voxguard.rc"
 )
 
 target_include_directories(VoxGuard PRIVATE

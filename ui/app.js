@@ -481,3 +481,19 @@ document.getElementById('adaptiveSidetone')?.addEventListener('change', e => {
 document.getElementById('overlayEnable')?.addEventListener('change', e => {
   sendMsg({ type: 'setOverlay', enabled: e.target.checked });
 });
+
+// ── Help / info overlay ───────────────────────────────────────────
+const helpOverlay = document.getElementById('helpOverlay');
+
+document.getElementById('helpBtn')?.addEventListener('click', () => {
+  helpOverlay.classList.remove('hidden');
+});
+
+document.getElementById('helpClose')?.addEventListener('click', () => {
+  helpOverlay.classList.add('hidden');
+});
+
+// Click the dark backdrop to close
+helpOverlay?.addEventListener('click', (e) => {
+  if (e.target === helpOverlay) helpOverlay.classList.add('hidden');
+});

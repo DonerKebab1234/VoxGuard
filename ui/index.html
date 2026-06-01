@@ -26,6 +26,7 @@
       <span class="status-label" id="statusLabel">Idle</span>
     </div>
     <div class="topbar-right">
+      <button class="help-btn" id="helpBtn" title="Feature guide">?</button>
       <span class="toggle-label">Enable</span>
       <label class="toggle-wrap">
         <input type="checkbox" id="masterEnable" checked>
@@ -253,6 +254,98 @@
     </div>
 
   </footer>
+
+
+  <!-- ── Help overlay ───────────────────────────────────────── -->
+  <div class="help-overlay hidden" id="helpOverlay">
+    <div class="help-card">
+
+      <div class="help-header">
+        <h2>VoxGuard — Feature Guide</h2>
+        <button class="help-close" id="helpClose">×</button>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">Why This Exists</div>
+        <div class="help-item">
+          <div class="help-item-desc">Game audio and loud Discord friends mask the sound of your own voice — your brain compensates by shouting. This is called the <strong>Lombard effect</strong>. VoxGuard fights it by letting you hear yourself (sidetone) and by quietly ducking the game when you speak.</div>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">Getting Started</div>
+        <div class="help-item">
+          <div class="help-item-label">Start / Stop</div>
+          <div class="help-item-desc">Begins microphone capture. All features require this to be running. Pick your microphone from the dropdown first.</div>
+        </div>
+        <div class="help-item">
+          <div class="help-item-label">Enable (top-right toggle)</div>
+          <div class="help-item-desc">Master kill switch — instantly pauses all processing without closing the app. Useful if you need to temporarily disable everything.</div>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">Sidetone</div>
+        <div class="help-item">
+          <div class="help-item-label">Sidetone (toggle + level slider)</div>
+          <div class="help-item-desc">Routes your mic directly to your headphones in real time with near-zero latency. When you can hear your own voice, you naturally stop shouting. The slider sets how loud you hear yourself.</div>
+        </div>
+        <div class="help-item">
+          <div class="help-item-label">Auto (Adaptive Sidetone)</div>
+          <div class="help-item-desc">Automatically raises the sidetone level as you get louder — so you still hear yourself even when the game gets intense.</div>
+        </div>
+        <div class="help-item">
+          <div class="help-item-label">DAF (Delayed Auditory Feedback)</div>
+          <div class="help-item-desc">Plays your voice back with a ~180 ms delay. This disrupts fluent speech and makes most people instinctively quiet down. Feels strange at first — use only if sidetone alone isn't enough.</div>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">Duck Game</div>
+        <div class="help-item">
+          <div class="help-item-label">Duck Game (toggle + amount slider)</div>
+          <div class="help-item-desc">Automatically lowers the game's volume when speaking is detected, so your voice cuts through without shouting. Restores full volume when you stop. The slider controls the reduction amount (0–80%).</div>
+        </div>
+        <div class="help-item">
+          <div class="help-item-label">App selector</div>
+          <div class="help-item-desc">Choose which application to duck. Defaults to all apps. Discord is never ducked, regardless of this setting.</div>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">Calibration</div>
+        <div class="help-item">
+          <div class="help-item-label">Calibrate Voice</div>
+          <div class="help-item-desc">Two-step process: speak at your <strong>normal gaming volume</strong> for 5 s, then at the <strong>loudest you'd want to sound</strong> for 5 s. VoxGuard uses these levels to set when features kick in. Run it once with your headset on and game audio at your usual volume.</div>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">Startup &amp; Display</div>
+        <div class="help-item">
+          <div class="help-item-label">Startup toggle</div>
+          <div class="help-item-desc">Adds VoxGuard to the Windows startup list. On next boot it starts hidden in the system tray. Right-click the tray icon to show the window or quit.</div>
+        </div>
+        <div class="help-item">
+          <div class="help-item-label">Overlay toggle</div>
+          <div class="help-item-desc">Shows a small always-on-top volume meter that stays visible over your game (even fullscreen). Useful to glance at your level without alt-tabbing.</div>
+        </div>
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-title">Meter &amp; Stats</div>
+        <div class="help-item">
+          <div class="help-item-label">Level meter</div>
+          <div class="help-item-desc">Shows your mic level in dBFS (decibels relative to full scale). <strong style="color:var(--green)">Green</strong> = normal voice, <strong style="color:var(--yellow)">yellow</strong> = elevated, <strong style="color:var(--red)">red</strong> = too loud. The white line is peak hold (1.6 s).</div>
+        </div>
+        <div class="help-item">
+          <div class="help-item-label">Session stats</div>
+          <div class="help-item-desc"><strong>Breaches</strong> = escalation events this session (sustained loud stretches). <strong>Score</strong> = 100 minus 5 per breach. <strong>Session</strong> = time since you clicked Start.</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
 
 </div>
 <script src="app.js"></script>

@@ -21,6 +21,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include "resource.h"   // IDR_UI_HTML / CSS / JS for embedded resource extraction
 #include <wrl/client.h>
 #include <wrl/event.h>
 #include <WebView2.h>
@@ -809,6 +810,55 @@ static std::wstring GetExeDir()
     return (pos != std::wstring::npos) ? p.substr(0, pos) : p;
 }
 
+// ── Embedded UI extraction ────────────────────────────────────────
+// Writes a RCDATA resource to disk. Returns true on success.
+static bool ExtractResToFile(WORD resId, const std::wstring& outPath)
+{
+    HMODULE hMod  = GetModuleHandleW(nullptr);
+    // RT_RCDATA == 10; use MAKEINTRESOURCEW so FindResourceW gets a wide-string type
+    HRSRC   hRes  = FindResourceW(hMod, MAKEINTRESOURCEW(resId), MAKEINTRESOURCEW(10));
+    if (!hRes) return false;
+    HGLOBAL hData = LoadResource(hMod, hRes);
+    if (!hData) return false;
+    void*  pData  = LockResource(hData);
+    DWORD  size   = SizeofResource(hMod, hRes);
+
+    HANDLE hFile = CreateFileW(outPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    WriteFile(hFile, pData, size, &written, nullptr);
+    CloseHandle(hFile);
+    return written == size;
+}
+
+// Returns the path to index.html to navigate to.
+// Priority: local ui\ folder (dev mode) → extract to %TEMP%\VoxGuard\ui\ (production).
+static std::wstring PrepareUiPath()
+{
+    // Dev/debug mode: use the ui\ folder next to the exe if it exists.
+    std::wstring localIndex = GetExeDir() + L"\\ui\\index.html";
+    if (GetFileAttributesW(localIndex.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return localIndex;
+
+    // Production: extract the three UI files to a temp directory.
+    wchar_t tempBase[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tempBase);
+
+    std::wstring voxDir = std::wstring(tempBase) + L"VoxGuard";
+    std::wstring uiDir  = voxDir + L"\\ui";
+
+    // Create directories (ignore "already exists" errors).
+    CreateDirectoryW(voxDir.c_str(), nullptr);
+    CreateDirectoryW(uiDir.c_str(), nullptr);
+
+    ExtractResToFile(IDR_UI_HTML, uiDir + L"\\index.html");
+    ExtractResToFile(IDR_UI_CSS,  uiDir + L"\\style.css");
+    ExtractResToFile(IDR_UI_JS,   uiDir + L"\\app.js");
+
+    return uiDir + L"\\index.html";
+}
+
 // Escape a wstring for embedding in a JSON string value
 static std::wstring JsonEscape(const std::wstring& s)
 {
@@ -1122,7 +1172,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_hwnd = hwnd;
         GenerateChime();
         // Tray icon is created from WinMain after we have the HINSTANCE
-        InitWebView(GetExeDir() + L"\\ui\\index.html");
+        InitWebView(PrepareUiPath());
         return 0;
     }
 
