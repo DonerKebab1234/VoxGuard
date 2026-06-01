@@ -316,7 +316,9 @@ function onCppMessage(raw) {
 
   switch (msg.type) {
     case 'pong':
+      clearInterval(_pingTimer);  // stop retrying once connected
       setStatus('active', 'Ready');
+      sendMsg({ type: 'getDevices' });  // ask for device list after connection confirmed
       break;
 
     case 'deviceList':
@@ -389,11 +391,24 @@ function onCppMessage(raw) {
 }
 
 // ── Bridge wiring ─────────────────────────────────────────────────
+let _pingTimer = null;
+let _pingTries = 0;
+
 if (bridge) {
   setStatus('connecting', 'Connecting…');
   bridge.addEventListener('message', e => onCppMessage(e.data));
-  sendMsg({ type: 'ping' });        // pong includes startWithWindows state
-  sendMsg({ type: 'getDevices' });
+  sendMsg({ type: 'ping' });
+
+  // Retry ping every 2 s in case the first one races with WebView2 init.
+  // Cleared when pong arrives. After 8 retries show an error hint.
+  _pingTimer = setInterval(() => {
+    if (_pingTries++ >= 8) {
+      clearInterval(_pingTimer);
+      setStatus('', 'Connect failed — restart app');
+      return;
+    }
+    sendMsg({ type: 'ping' });
+  }, 2000);
 } else {
   // Browser preview mode — fake moving meter + fake calibration
   setStatus('', 'Preview');
