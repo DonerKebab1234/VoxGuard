@@ -315,10 +315,14 @@ function onCppMessage(raw) {
   try { msg = JSON.parse(raw); } catch { return; }
 
   switch (msg.type) {
+    case 'hostReady':
+      // C++ fires this after NavigationCompleted — most reliable connection path
+      onConnected(msg.startWithWindows);
+      break;
+
     case 'pong':
-      clearInterval(_pingTimer);  // stop retrying once connected
-      setStatus('active', 'Ready');
-      sendMsg({ type: 'getDevices' });  // ask for device list after connection confirmed
+      // Fallback: JS pinged C++ and got a response
+      onConnected(msg.startWithWindows);
       break;
 
     case 'deviceList':
@@ -391,20 +395,34 @@ function onCppMessage(raw) {
 }
 
 // ── Bridge wiring ─────────────────────────────────────────────────
-let _pingTimer = null;
-let _pingTries = 0;
+let _pingTimer  = null;
+let _pingTries  = 0;
+let _connected  = false;  // true once hostReady or pong arrives
+
+// Called by both hostReady and pong so we only do this once.
+function onConnected(startWithWindows) {
+  if (_connected) return;
+  _connected = true;
+  clearInterval(_pingTimer);
+  if (startWithWindows !== undefined)
+    document.getElementById('startWithWindows').checked = !!startWithWindows;
+  setStatus('active', 'Ready');
+  sendMsg({ type: 'getDevices' });
+}
 
 if (bridge) {
   setStatus('connecting', 'Connecting…');
   bridge.addEventListener('message', e => onCppMessage(e.data));
+
+  // C++ sends hostReady after NavigationCompleted — that's the primary path.
+  // Send a ping too as a fallback in case navigation events are slow.
   sendMsg({ type: 'ping' });
 
-  // Retry ping every 2 s in case the first one races with WebView2 init.
-  // Cleared when pong arrives. After 8 retries show an error hint.
+  // Retry ping every 2 s; cleared when hostReady or pong arrives.
   _pingTimer = setInterval(() => {
     if (_pingTries++ >= 8) {
       clearInterval(_pingTimer);
-      setStatus('', 'Connect failed — restart app');
+      if (!_connected) setStatus('', 'Connect failed — try restarting');
       return;
     }
     sendMsg({ type: 'ping' });

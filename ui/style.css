@@ -369,26 +369,26 @@ html, body {
 .settings {
   display: flex;
   align-items: stretch;
-  height: 72px;
+  flex-wrap: wrap;          /* groups wrap to a new row rather than overlapping */
+  min-height: 72px;
+  height: auto;
   background: var(--surface);
   border-top: 1px solid var(--border-dim);
   flex-shrink: 0;
-  overflow-x: auto; /* scroll horizontally if window too narrow */
-  overflow-y: hidden;
 }
 
 .setting-group {
-  flex: 1;
+  flex: 1 0 160px;          /* grow freely, never shrink below 160px */
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 6px;
   padding: 0 18px;
   border-right: 1px solid var(--border-dim);
-  min-width: 150px; /* prevent groups from collapsing completely */
+  border-bottom: 1px solid var(--border-dim);
+  min-height: 72px;
 }
-.setting-group:last-child { border-right: none; }
-.setting-group--narrow { flex: 0 0 auto; min-width: 130px; }
+.setting-group--narrow { flex: 1 0 130px; }
 
 .setting-label {
   display: flex;

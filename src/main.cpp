@@ -1147,6 +1147,24 @@ static void InitWebView(std::wstring htmlFilePath)
                                 ).Get(), nullptr
                             );
 
+                            // When navigation finishes, C++ proactively tells JS it's ready.
+                            // This is more robust than waiting for JS to ping us — avoids any
+                            // race between the page loading and the bridge being ready.
+                            g_webview->add_NavigationCompleted(
+                                Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                                    [](ICoreWebView2* wv,
+                                       ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
+                                        bool sww = GetStartWithWindows();
+                                        wchar_t buf[256];
+                                        swprintf_s(buf,
+                                            L"{\"type\":\"hostReady\",\"startWithWindows\":%s}",
+                                            sww ? L"true" : L"false");
+                                        wv->PostWebMessageAsJson(buf);
+                                        return S_OK;
+                                    }
+                                ).Get(), nullptr
+                            );
+
                             ResizeWebView();
                             g_webview->Navigate(url.c_str());
 
